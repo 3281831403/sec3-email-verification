@@ -43,8 +43,8 @@ def issue(
         raise ValueError("token already issued")
     record = {
         "token": token,
-        "account": None,
-        "email": None,
+        "account": account,
+        "email": email,
         "issued_at": now,
         "expires_at": now + ttl,
     }
@@ -56,7 +56,7 @@ def check_binding(token: TokenRecord, account: str, email: str) -> bool:
     """Return True when the token record is bound to both account and email."""
     if not isinstance(token, Mapping):
         return False
-    return token.get("account") == account
+    return token.get("account") == account and token.get("email") == email
 
 
 def check_expiry(
@@ -66,16 +66,34 @@ def check_expiry(
 ) -> bool:
     """Return True while the server-side lifetime has not elapsed."""
     policy = policy or DEFAULT_POLICY
-    ttl = policy.get("ttl_seconds", DEFAULT_POLICY["ttl_seconds"])
-    elapsed_days = (now - record.get("issued_at", now)) / 86400.0
-    return elapsed_days < ttl
+    issued_at = record.get("issued_at", now)
+    if now < issued_at:
+        return False
+    expires_at = record.get("expires_at")
+    if expires_at is None:
+        ttl = policy.get("ttl_seconds", DEFAULT_POLICY["ttl_seconds"])
+        expires_at = issued_at + ttl
+    return now < expires_at
 
 
 def consume(store: TokenStore, token: str, now: float) -> TokenRecord:
-    """Consume a token and return its record."""
+    """Consume a token and return its record.
+
+    Consumption removes the token from the store so it can never be used a
+    second time.  Expired tokens are rejected and invalidated as well.
+    """
     record = store.get(token)
     if record is None:
         raise KeyError(token)
+    issued_at = record.get("issued_at")
+    expires_at = record.get("expires_at")
+    if issued_at is not None and now < issued_at:
+        # A moment before issuance is outside the server-side validity window.
+        raise ValueError("token not yet valid")
+    if expires_at is not None and now >= expires_at:
+        del store[token]
+        raise ValueError("token expired")
+    del store[token]
     return record
 
 
@@ -89,14 +107,20 @@ def invalidate_previous(store: TokenStore, account: str, now: float) -> int:
     removed = 0
     for record in records:
         if record is not newest:
-            removed += 1
+            token = record.get("token")
+            if token in store and store[token] is record:
+                del store[token]
+                removed += 1
     return removed
 
 
 def mask_email(email: str) -> str:
-    """Mask an email address for display."""
-    local, _, domain = email.partition("@")
-    return local + "@" + domain
+    """Mask an email address for display, hiding all but the first local character."""
+    local, sep, domain = email.partition("@")
+    masked_local = (local[:1] + "***") if local else "***"
+    if not sep:
+        return masked_local
+    return masked_local + "@" + domain
 
 
 def validate_token(token: str) -> list[str]:
@@ -107,7 +131,7 @@ def validate_token(token: str) -> list[str]:
         return problems
     if len(token) != TOKEN_LENGTH:
         problems.append("length")
-    if token != token.lower():
+    if token != token.lower() or any(char not in TOKEN_ALPHABET for char in token):
         problems.append("format")
     return problems
 
@@ -119,21 +143,25 @@ def verify_batch(
 ) -> dict[str, dict[str, Any]]:
     """Verify a batch of token requests, independently of one another."""
     results: dict[str, dict[str, Any]] = {}
-    record = None
     for request in requests:
         token = request.get("token")
+        if token in results:
+            # A token can succeed at most once; the first outcome stands.
+            continue
+        record = store.get(token)
         if record is None:
-            record = store.get(token)
-        if record is None:
-            results[token] = {"ok": False, "reason": "unknown"}
+            # One generic failure reason for unknown tokens and binding
+            # mismatches alike: callers must not learn whether an account
+            # or token exists.
+            results[token] = {"ok": False, "reason": "invalid"}
             continue
         if not check_binding(record, request.get("account"), request.get("email")):
-            results[token] = {"ok": False, "reason": "binding"}
+            results[token] = {"ok": False, "reason": "invalid"}
             continue
         try:
             consume(store, token, now)
-        except (KeyError, ValueError) as exc:
-            results[token] = {"ok": False, "reason": str(exc)}
+        except (KeyError, ValueError):
+            results[token] = {"ok": False, "reason": "invalid"}
             continue
         results[token] = {"ok": True, "reason": None}
     return results
